@@ -247,16 +247,17 @@ local function get_rs5k_params(track, fx)
   length_norm = math.max(0, math.min(1, length_norm or 1))
 
   -- Calculate the *actual* End Offset
-  local end_offset_norm = start_offset_norm + (1 - start_offset_norm) * length_norm
+  --local end_offset_norm = start_offset_norm + (1 - start_offset_norm) * length_norm
+  local end_offset_norm = length_norm
 
   -- Debug Print
-  --msg("DEBUG PARAMS (NEW LOGIC):")
-  --msg("  Start Offset (Param 13): " .. string.format("%.3f", start_offset_norm))
-  --msg("  Length (Param 14): " .. string.format("%.3f", length_norm))
-  --msg("  Note Start (Param 3): " .. note_start)
-  --msg("  Pitch Offset (Param 5): " .. pitch_start_offset .. " semitones (from string '" .. pitch_offset_str .. "')")
-  --msg("  EFFECTIVE Root Note: " .. root_note .. " (NoteStart - Offset)")
-  --msg("  CALCULATED End Offset: " .. string.format("%.3f", end_offset_norm))
+  msg("DEBUG PARAMS (NEW LOGIC):")
+  msg("  Start Offset (Param 13): " .. string.format("%.3f", start_offset_norm))
+  msg("  Length (Param 14): " .. string.format("%.3f", length_norm))
+  msg("  Note Start (Param 3): " .. note_start)
+  msg("  Pitch Offset (Param 5): " .. pitch_start_offset .. " semitones (from string '" .. pitch_offset_str .. "')")
+  msg("  EFFECTIVE Root Note: " .. root_note .. " (NoteStart - Offset)")
+  msg("  CALCULATED End Offset: " .. string.format("%.3f", end_offset_norm))
 
   -- Sanity Check
   if end_offset_norm <= start_offset_norm then
@@ -421,7 +422,7 @@ local function handle_note_off(note)
     -- *** NEW VALIDATION LINE ***
     -- Check if the item pointer is still valid before using it
     if not reaper.ValidatePtr2(0, item, "MediaItem*") then
-      --msg("Note Off: Item pointer was invalid, skipping trim.")
+      msg("Note Off: Item pointer was invalid, skipping trim.")
       note_to_item[note] = nil -- Clear the invalid lock
       return 
     end
@@ -440,7 +441,7 @@ local function handle_note_off(note)
       -- Trim the item by setting its new, shorter length
       reaper.SetMediaItemInfo_Value(item, "D_LENGTH", new_duration)
       reaper.UpdateArrange()
-      --msg("Note Off: Trimmed item to " .. new_duration .. "s")
+      msg("Note Off: Trimmed item to " .. new_duration .. "s")
     end
   end -- <<< ADD THIS 'END' to close 'if info and info.item then'
   -- Clear the note from the active table
@@ -532,7 +533,7 @@ if new_last_seq > 0 then
 
   -- *** NEW DEBUGGING ***
   if #events_to_process > 0 then
-   -- msg("MainLoop: Found " .. #events_to_process .. " new event(s).")
+   msg("MainLoop: Found " .. #events_to_process .. " new event(s).")
   end
 
   -- 3. Process the events we collected, in reverse order (oldest to newest)
@@ -549,13 +550,13 @@ if new_last_seq > 0 then
 
       -- Route to our handlers
       if status == 0x90 then -- Note On
-        --msg("MainLoop: Event is Note On. Calling handle_note_on...")
+        msg("MainLoop: Event is Note On. Calling handle_note_on...")
         if b3 > 0 then handle_note_on(b2)
         else handle_note_off(b2) end
         did_process_note = true
         
       elseif status == 0x80 then -- Note Off
-        --msg("MainLoop: Event is Note Off. Calling handle_note_off...")
+        msg("MainLoop: Event is Note Off. Calling handle_note_off...")
         handle_note_off(b2)
         did_process_note = true
         
