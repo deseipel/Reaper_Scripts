@@ -30,19 +30,13 @@ local PITCH_BEND_RANGE_SEMITONES = 6 -- +/- 6 semitones
 -- 🧩 Internal Caches
 --------------------------------------------------
 local source_cache = {}     -- [filepath] = PCM_Source
-
 local spawned_items = {}    -- [item] = end time for cleanup
-
 local note_to_item = {} -- [note] = { item, take, root_note, incoming_note }
-local last_pitch_bucket = -1 -- For rate-limiting pitch bend
 
--- Load our persistent variables from the project
--- We are using "_v2" to reset the script's memory.
-local last_seq_str = reaper.GetExtState("RS5K_VID_SAMPLER", "last_seq_v2")
-local last_processed_event_seq = tonumber(last_seq_str) or 0
-
-local last_bend_str = reaper.GetExtState("RS5K_VID_SAMPLER", "last_bend_v2")
-local g_current_bend_semitones = tonumber(last_bend_str) or 0.0
+-- Reset all variables on startup.
+local last_processed_event_seq = 0
+local last_pitch_bucket = -1
+local g_current_bend_semitones = 0.0
 --------------------------------------------------
 -- 🧠 Utility Functions
 --------------------------------------------------
@@ -121,7 +115,7 @@ local function get_or_create_video_track()
   reaper.SetMediaTrackInfo_Value(tr, "I_RECMON", 0)
   return tr
 end
-
+ --[[
 local function find_rs5k_fx(track)
   local fx_count = reaper.TrackFX_GetCount(track)
   local rs5k_prefix = "(rs5k)" -- Custom prefix check
@@ -147,6 +141,7 @@ local function find_rs5k_fx(track)
   
   return nil
 end
+--]]
 
 local function get_sample_path(track, fx)
   
@@ -355,54 +350,63 @@ local function handle_note_on(note)
     return 
   end
 
+  -- Loop ALL tracks
   for t = 0, reaper.CountTracks(0) - 1 do
     local track = reaper.GetTrack(0, t)
-    local fx = find_rs5k_fx(track)
-
-    if fx then
-      msg("Found RS5k on track " .. t)
-
-      -- Get this RS5k's note range
-      local note_start = math.floor(reaper.TrackFX_GetParam(track, fx, NOTE_START_PARAM_IDX, 0, 0) * 127 + 0.5)
-      local note_end = math.floor(reaper.TrackFX_GetParam(track, fx, NOTE_END_PARAM_IDX, 0, 0) * 127 + 0.5)
+    
+    -- Loop ALL FX on this track
+    for fx = 0, reaper.TrackFX_GetCount(track) - 1 do
+    
+      -- Check if this specific FX is an RS5k
+      local retval, name = reaper.TrackFX_GetFXName(track, fx, "")
       
-      msg("Checking note range... Script read: " .. note_start .. " to " .. note_end)
+      -- A simple check for the plugin name
+      if retval and name and (name:find("ReaSamplOmatic5000") or name:lower():find("(rs5k)")) then
+        msg("Found RS5k on track " .. t .. ", FX slot " .. fx)
+        
+        -- Get this RS5k's note range
+        local note_start = math.floor(reaper.TrackFX_GetParam(track, fx, NOTE_START_PARAM_IDX, 0, 0) * 127 + 0.5)
+        local note_end = math.floor(reaper.TrackFX_GetParam(track, fx, NOTE_END_PARAM_IDX, 0, 0) * 127 + 0.5)
+        
+        msg("Checking note range... Script read: " .. note_start .. " to " .. note_end)
 
-      -- Check if the note we played is within this plugin's range
-      if note >= note_start and note <= note_end then
-        msg("Note " .. note .. " is IN RANGE.")
-        
-        local path = get_sample_path(track, fx)
-        msg("Checking path... Path found: " .. (path or "nil"))
-        
-        if path and path:lower():find(".mp4") then
-          msg("Path is a valid .mp4. Calling spawn_video...")
+        -- Check if the note we played is within this plugin's range
+        if note >= note_start and note <= note_end then
+          msg("Note " .. note .. " is IN RANGE.")
           
-          local start_norm, end_norm, root_note = get_rs5k_params(track, fx)
+          local path = get_sample_path(track, fx) -- Pass the correct 'fx' index
+          msg("Checking path... Path found: " .. (path or "nil"))
           
-          -- Spawn the video and get the item and take
-          local item, take = spawn_video(path, start_norm, end_norm, note, root_note) 
-          
-          if item and take then
-            -- Store all info needed for pitch bend and note-off
-            note_to_item[note] = {
-              item = item,
-              take = take, -- We need this for pitch bend
-              start_time = reaper.GetPlayPosition(),
-              root_note = root_note,
-              incoming_note = note
-            }
-            msg("Video spawned and locked to note " .. note)
+          if path and path:lower():find(".mp4") then
+            msg("Path is a valid .mp4. Calling spawn_video...")
+            
+            local start_norm, end_norm, root_note = get_rs5k_params(track, fx)
+            
+            local item, take = spawn_video(path, start_norm, end_norm, note, root_note) 
+            
+            if item and take then
+              note_to_item[note] = {
+                item = item,
+                take = take,
+                start_time = reaper.GetPlayPosition(),
+                root_note = root_note,
+                incoming_note = note
+              }
+              msg("Video spawned and locked to note " .. note)
+              
+              -- We found a match, but we DON'T break.
+              -- We continue checking other FX slots.
+            else
+              msg("ERROR: spawn_video was called but returned nil.")
+            end
           else
-            msg("ERROR: spawn_video was called but returned nil.")
+            msg("Path was nil or not an .mp4. Aborting this FX.")
           end
         else
-          msg("Path was nil or not an .mp4. Aborting.")
-        end
-      else
-        msg("Note " .. note .. " is OUTSIDE range. Aborting.")
-      end -- end if note in range
-    end -- end if fx
+          msg("Note " .. note .. " is OUTSIDE range. Checking next FX.")
+        end -- end if note in range
+      end -- end if is rs5k
+    end -- end FX loop
   end -- end track loop
 end
 
@@ -455,14 +459,17 @@ local function handle_modwheel(val) -- val is 0-127
 end
 
 local function handle_pitch_bend(val) -- val is 0-16383
+  -- OPTIMIZATION...
+  local pitch_bucket = math.floor(val / 64)
+  if pitch_bucket == last_pitch_bucket then
+    return
+  end
+  last_pitch_bucket = pitch_bucket
+
   -- 1. CALCULATE AND STORE THE NEW GLOBAL BEND
   g_current_bend_semitones = ((val - 8192) / 8191) * PITCH_BEND_RANGE_SEMITONES
   
-  -- 2. SAVE the new bend value to project memory
-  reaper.SetExtState("RS5K_VID_SAMPLER", "last_bend_v2", tostring(g_current_bend_semitones), true)
-  
-  -- We no longer loop through items here. This makes the
-  -- real-time MIDI processing extremely fast.
+  -- We no longer save to the project.
 end
 
 --------------------------------------------------
@@ -518,14 +525,13 @@ local function main()
   end
 
   -- 2. If we found new events, update our "last processed" marker
-  if new_last_seq > 0 then
+if new_last_seq > 0 then
     last_processed_event_seq = new_last_seq
-    reaper.SetExtState("RS5K_VID_SAMPLER", "last_seq_v2", tostring(last_processed_event_seq), true)
   end
 
   -- *** NEW DEBUGGING ***
   if #events_to_process > 0 then
-    msg("MainLoop: Found " .. #events_to_process .. " new event(s).")
+   -- msg("MainLoop: Found " .. #events_to_process .. " new event(s).")
   end
 
   -- 3. Process the events we collected, in reverse order (oldest to newest)
@@ -538,17 +544,17 @@ local function main()
       local status = b1 & 0xF0
 
       -- *** NEW DEBUGGING ***
-      msg("MainLoop: Processing event. Status: " .. string.format("0x%X", status))
+      --msg("MainLoop: Processing event. Status: " .. string.format("0x%X", status))
 
       -- Route to our handlers
       if status == 0x90 then -- Note On
-        msg("MainLoop: Event is Note On. Calling handle_note_on...")
+        --msg("MainLoop: Event is Note On. Calling handle_note_on...")
         if b3 > 0 then handle_note_on(b2)
         else handle_note_off(b2) end
         did_process_note = true
         
       elseif status == 0x80 then -- Note Off
-        msg("MainLoop: Event is Note Off. Calling handle_note_off...")
+        --msg("MainLoop: Event is Note Off. Calling handle_note_off...")
         handle_note_off(b2)
         did_process_note = true
         
@@ -556,12 +562,12 @@ local function main()
         --handle_modwheel(b3) -- Still DISABLED
         
       elseif status == 0xE0 then -- Pitch Bend
-        msg("MainLoop: Event is Pitch Bend. Calling handle_pitch_bend...")
+        --msg("MainLoop: Event is Pitch Bend. Calling handle_pitch_bend...")
         local bend_val = (b3 * 128) + b2 -- 14-bit value
         handle_pitch_bend(bend_val)
         -- We DON'T set the flag here, to prevent console spam
       else
-        msg("MainLoop: Event is other status, ignoring.")
+        --msg("MainLoop: Event is other status, ignoring.")
       end
     end
   end
