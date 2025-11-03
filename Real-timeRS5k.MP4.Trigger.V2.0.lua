@@ -82,7 +82,7 @@ local function ParseNoteString(note_str)
   local note_char, accidental, octave = note_str:match("([A-Ga-g])([#b]?)(-?[0-9]+)")
   
   if not note_char then
-    msg("Error parsing note string: " .. note_str .. ". Defaulting to A4 (69).")
+    --msg("Error parsing note string: " .. note_str .. ". Defaulting to A4 (69).")
     return 69 -- Default to A4 if parsing fails
   end
   
@@ -178,7 +178,7 @@ local function get_sample_path(track, fx)
       if path then
         -- Clean up null bytes and trailing whitespace from the decoded string
         path = path:gsub('\0', ''):gsub('%s+$', '')
-        msg("Path found via Base64 decode: " .. path)
+        --msg("Path found via Base64 decode: " .. path)
         return path
       end
     end
@@ -190,12 +190,12 @@ end
 
 local function get_pcm_source(path)
   if source_cache[path] then 
-    msg("Cache hit for: " .. path)
+    --msg("Cache hit for: " .. path)
     return source_cache[path] 
   end
   
   -- Step 1: Print the path being used
-  msg("Attempting to load PCM_Source from path: [" .. path .. "]")
+  --msg("Attempting to load PCM_Source from path: [" .. path .. "]")
   
   -- Ensure only standard Windows directory separators are used (optional safety)
   local clean_path = path:gsub("/", "\\")
@@ -205,11 +205,11 @@ local function get_pcm_source(path)
   
   -- Step 3: Check the result and report
   if src then
-    msg("SUCCESS: PCM_Source created.")
+    --msg("SUCCESS: PCM_Source created.")
     source_cache[path] = src
     return src
   else
-    msg("FAILURE: reaper.PCM_Source_CreateFromFile failed for path: [" .. clean_path .. "]")
+    --msg("FAILURE: reaper.PCM_Source_CreateFromFile failed for path: [" .. clean_path .. "]")
     -- Return nil so the calling function can exit gracefully
     return nil 
   end
@@ -250,17 +250,17 @@ local function get_rs5k_params(track, fx)
   local end_offset_norm = start_offset_norm + (1 - start_offset_norm) * length_norm
 
   -- Debug Print
-  msg("DEBUG PARAMS (NEW LOGIC):")
-  msg("  Start Offset (Param 13): " .. string.format("%.3f", start_offset_norm))
-  msg("  Length (Param 14): " .. string.format("%.3f", length_norm))
-  msg("  Note Start (Param 3): " .. note_start)
-  msg("  Pitch Offset (Param 5): " .. pitch_start_offset .. " semitones (from string '" .. pitch_offset_str .. "')")
-  msg("  EFFECTIVE Root Note: " .. root_note .. " (NoteStart - Offset)")
-  msg("  CALCULATED End Offset: " .. string.format("%.3f", end_offset_norm))
+  --msg("DEBUG PARAMS (NEW LOGIC):")
+  --msg("  Start Offset (Param 13): " .. string.format("%.3f", start_offset_norm))
+  --msg("  Length (Param 14): " .. string.format("%.3f", length_norm))
+  --msg("  Note Start (Param 3): " .. note_start)
+  --msg("  Pitch Offset (Param 5): " .. pitch_start_offset .. " semitones (from string '" .. pitch_offset_str .. "')")
+  --msg("  EFFECTIVE Root Note: " .. root_note .. " (NoteStart - Offset)")
+  --msg("  CALCULATED End Offset: " .. string.format("%.3f", end_offset_norm))
 
   -- Sanity Check
   if end_offset_norm <= start_offset_norm then
-      msg("WARNING: RS5K sample range is zero/negative. Forcing Start=0.0, End=1.0.")
+      --msg("WARNING: RS5K sample range is zero/negative. Forcing Start=0.0, End=1.0.")
       start_offset_norm = 0.0
       end_offset_norm = 1.0
   end
@@ -345,10 +345,13 @@ end
 local function handle_note_on(note)
   msg("--- handle_note_on triggered. Note: " .. note)
 
+  -- *** NEW RE-TRIGGER LOGIC ***
   if note_to_item[note] then 
-    msg("Note " .. note .. " is already on. Aborting.")
-    return 
+    msg("Note " .. note .. " is already on. Forcing re-trigger...")
+    -- Call handle_note_off to trim the old item and unlock the note
+    handle_note_off(note) 
   end
+  -- *** END NEW LOGIC ***
 
   -- Loop ALL tracks
   for t = 0, reaper.CountTracks(0) - 1 do
@@ -394,8 +397,6 @@ local function handle_note_on(note)
               }
               msg("Video spawned and locked to note " .. note)
               
-              -- We found a match, but we DON'T break.
-              -- We continue checking other FX slots.
             else
               msg("ERROR: spawn_video was called but returned nil.")
             end
@@ -420,7 +421,7 @@ local function handle_note_off(note)
     -- *** NEW VALIDATION LINE ***
     -- Check if the item pointer is still valid before using it
     if not reaper.ValidatePtr2(0, item, "MediaItem*") then
-      msg("Note Off: Item pointer was invalid, skipping trim.")
+      --msg("Note Off: Item pointer was invalid, skipping trim.")
       note_to_item[note] = nil -- Clear the invalid lock
       return 
     end
@@ -439,7 +440,7 @@ local function handle_note_off(note)
       -- Trim the item by setting its new, shorter length
       reaper.SetMediaItemInfo_Value(item, "D_LENGTH", new_duration)
       reaper.UpdateArrange()
-      msg("Note Off: Trimmed item to " .. new_duration .. "s")
+      --msg("Note Off: Trimmed item to " .. new_duration .. "s")
     end
   end -- <<< ADD THIS 'END' to close 'if info and info.item then'
   -- Clear the note from the active table
@@ -490,7 +491,7 @@ local function updater()
     end
   end
   
-  -- Run this function again in 0.066 seconds (~15fps)
+
   reaper.defer(updater)
 end
 
@@ -579,6 +580,7 @@ if new_last_seq > 0 then
 
   reaper.defer(main)
 end
+
 --------------------------------------------------
 -- 🚀 Start
 --------------------------------------------------
@@ -587,4 +589,3 @@ get_or_create_video_track()
 main()
 updater() -- <<< ADD THIS to start the 15fps UI loop
   
-
