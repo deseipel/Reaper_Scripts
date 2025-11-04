@@ -37,6 +37,8 @@ local note_to_item = {} -- [note] = { item, take, root_note, incoming_note }
 local last_processed_event_seq = 0
 local last_pitch_bucket = -1
 local g_current_bend_semitones = 0.0
+
+local g_is_first_run = true -- <<< ADD THIS LINE
 --------------------------------------------------
 -- 🧠 Utility Functions
 --------------------------------------------------
@@ -442,8 +444,8 @@ local function handle_note_off(note)
       reaper.SetMediaItemInfo_Value(item, "D_LENGTH", new_duration)
       reaper.UpdateArrange()
       msg("Note Off: Trimmed item to " .. new_duration .. "s")
-    end
-  end -- <<< ADD THIS 'END' to close 'if info and info.item then'
+    end  -- end new duration
+  end -- <<< ADD THIS \'END\' to close 'if info and info.item then'
   -- Clear the note from the active table
   note_to_item[note] = nil
 end
@@ -497,10 +499,37 @@ local function updater()
 end
 
 --------------------------------------------------
--- ♻️ Main Deferred Loop (Extra-Verbose Debug)
+-- ♻️ Main Deferred Loop (Correct Latching Logic)
 --------------------------------------------------
 
 local function main()
+
+  -- *** NEW "FIRST RUN" LOGIC ***
+  if g_is_first_run then
+    -- On the very first run, we find the sequence number
+    -- of the MOST recent event in the history and use it
+    -- as our starting point. This ignores the entire "blob".
+    local retval, _, _, _, _, _ = reaper.MIDI_GetRecentInputEvent(0)
+    
+    if retval > 0 then
+      last_processed_event_seq = retval
+    end
+    
+    msg("Script initialized. Ignoring all past MIDI history.")
+    
+    -- Set the flag to false so this block never runs again
+    g_is_first_run = false
+    
+    -- Defer and exit this run
+    reaper.defer(main)
+    return
+  end
+  -- *** END NEW LOGIC ***
+  
+  
+  -- This is your existing, correct loop.
+  -- It will now only find events with a sequence
+  -- number greater than the one we just latched.
   local events_to_process = {}
   local new_last_seq = 0
   local idx = 0
@@ -527,13 +556,8 @@ local function main()
   end
 
   -- 2. If we found new events, update our "last processed" marker
-if new_last_seq > 0 then
+  if new_last_seq > 0 then
     last_processed_event_seq = new_last_seq
-  end
-
-  -- *** NEW DEBUGGING ***
-  if #events_to_process > 0 then
-   msg("MainLoop: Found " .. #events_to_process .. " new event(s).")
   end
 
   -- 3. Process the events we collected, in reverse order (oldest to newest)
@@ -545,18 +569,12 @@ if new_last_seq > 0 then
       local b1, b2, b3 = string.byte(msg_str, 1, 3)
       local status = b1 & 0xF0
 
-      -- *** NEW DEBUGGING ***
-      --msg("MainLoop: Processing event. Status: " .. string.format("0x%X", status))
-
-      -- Route to our handlers
       if status == 0x90 then -- Note On
-        msg("MainLoop: Event is Note On. Calling handle_note_on...")
         if b3 > 0 then handle_note_on(b2)
         else handle_note_off(b2) end
         did_process_note = true
         
       elseif status == 0x80 then -- Note Off
-        msg("MainLoop: Event is Note Off. Calling handle_note_off...")
         handle_note_off(b2)
         did_process_note = true
         
@@ -564,12 +582,8 @@ if new_last_seq > 0 then
         --handle_modwheel(b3) -- Still DISABLED
         
       elseif status == 0xE0 then -- Pitch Bend
-        --msg("MainLoop: Event is Pitch Bend. Calling handle_pitch_bend...")
         local bend_val = (b3 * 128) + b2 -- 14-bit value
         handle_pitch_bend(bend_val)
-        -- We DON'T set the flag here, to prevent console spam
-      else
-        --msg("MainLoop: Event is other status, ignoring.")
       end
     end
   end
