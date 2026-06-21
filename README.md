@@ -8,3 +8,9 @@ example settings:
 
 <img width="597" height="523" alt="image" src="https://github.com/user-attachments/assets/b1a2766d-e2a5-4065-9797-97d3629f36f1" />
 
+
+#Video Tweaks
+<img width="1131" height="509" alt="image" src="https://github.com/user-attachments/assets/5e2c2ab0-ff2f-441c-9793-f06abaad91a0" />
+
+
+
