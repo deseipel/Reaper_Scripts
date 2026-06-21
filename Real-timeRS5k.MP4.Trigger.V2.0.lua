@@ -1,606 +1,440 @@
 --[[
-Real-time RS5K → MP4 Video Sampler (v2.0 - Queue-Based)
-Author: Reaper DAW Ultimate Assistant
-Version: 2.0 (Uses MIDI Queue)
-
-Purpose:
-  - Listens for MIDI events via the REAPER event queue (lossless).
-  - Triggers different RS5K instances based on MIDI note ranges.
-  - Handles Note-On, Note-Off, Pitch Bend, and Mod Wheel.
+  Real-time RS5K -> MP4 Video Sampler (v7.2 - Fixed Rate Drum Trigger)
+  Plays MP4/MKV/MOV video items in sync with RS5K sample playback.
 --]]
 
---------------------------------------------------
--- 🔧 CONFIG
---------------------------------------------------
-local VIDEO_TRACK_NAME = "RS5K_Video_Output"
-local MIDI_DEVICE_ID = 0 -- 0 = all MIDI inputs
-local DEBUG = true
+--------------------------------------------------------------------------------
+-- CONFIG
+--------------------------------------------------------------------------------
+local VIDEO_TRACK_NAME       = "RS5K_Video_Output"
+local PITCH_BEND_RANGE_ST    = 6  -- semitones
 
--- RS5K Parameter Indexes
-local NOTE_START_PARAM_IDX = 3 -- RS5K "Note start"
-local NOTE_END_PARAM_IDX   = 4 -- RS5K "Note end"
-local PITCH_ROOT_NOTE_IDX = 5 -- RS5K "Pitch@start (note)"
-local START_OFFSET_PARAM_IDX = 13 -- RS5K "Sample start offset"
-local LENGTH_PARAM_IDX = 14 -- RS5K "Sample length"
+-- RS5K parameter indexes
+local IDX_NOTE_START         = 3
+local IDX_NOTE_END           = 4
+local IDX_START_OFFSET       = 13
+local IDX_LENGTH             = 14
+local IDX_OBEY_NOTE_OFFS     = 11
 
--- Pitch Bend Config
-local PITCH_BEND_RANGE_SEMITONES = 6 -- +/- 6 semitones
+--------------------------------------------------------------------------------
+-- STATE
+--------------------------------------------------------------------------------
+local active_voices          = {}     
+local g_voice_count          = 0
+local g_last_seq             = 0
+local g_is_first_run         = true
+local g_bend_semitones       = 0.0
+local g_last_pitch_bucket    = -1
+local g_last_played = { chan = nil, note = nil }
+local g_mod_wheel_val        = 0.0    
+local g_base_offsets         = {}     -- NEW: Remembers your manual RS5K start tweaks
+local g_last_forced_offset   = {}     -- NEW: The "fingerprint" of the last script override
 
---------------------------------------------------
--- 🧩 Internal Caches
---------------------------------------------------
-local source_cache = {}     -- [filepath] = PCM_Source
-local spawned_items = {}    -- [item] = end time for cleanup
-local note_to_item = {} -- [note] = { item, take, root_note, incoming_note }
+-- Transport
+local g_transport_owned      = false  
+local g_initial_cursor_pos   = 0
+local g_pending_play         = false  
 
--- Reset all variables on startup.
-local last_processed_event_seq = 0
-local last_pitch_bucket = -1
-local g_current_bend_semitones = 0.0
+-- Debug log
+local g_log                  = {}
+local LOG_MAX                = 30
+local g_log_frozen           = false
 
-local g_is_first_run = true -- <<< ADD THIS LINE
---------------------------------------------------
--- 🧠 Utility Functions
---------------------------------------------------
-local function msg(text)
-  if DEBUG then reaper.ShowConsoleMsg(tostring(text).."\n") end
+-- UI display values
+local UI_FILE  = "None"
+local UI_NOTE  = "None"
+local UI_RATE  = "1.00x"
+
+--------------------------------------------------------------------------------
+-- DEBUG LOG & UI
+--------------------------------------------------------------------------------
+local function log(msg)
+  if g_log_frozen then return end
+  table.insert(g_log, 1, string.format("[%.3f] %s", reaper.time_precise(), msg))
+  if #g_log > LOG_MAX then table.remove(g_log) end
 end
 
--- Base64 utility table
-local B64 = {
-    _ = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
-    d = {}
-}
-for i = 1, #B64._ do
-    B64.d[B64._:sub(i, i)] = i - 1
+local function init_ui()
+  gfx.init("RS5K Video Linker v7.2", 700, 370, 0, 100, 100)
+  gfx.setfont(1, "Arial", 14)
 end
 
--- Function to decode a Base64 string
-local function base64_decode(str)
-    str = str:gsub("[^"..B64._.."=]", "")
-    local mod = #str % 4
-    if mod == 2 then str = str .. "==" end
-    if mod == 3 then str = str .. "=" end
-    
-    local bytes = {}
-    for i = 1, #str, 4 do
-        local b1 = B64.d[str:sub(i, i)]
-        local b2 = B64.d[str:sub(i+1, i+1)]
-        local b3 = B64.d[str:sub(i+2, i+2)]
-        local b4 = B64.d[str:sub(i+3, i+3)]
-        
-        if b1 then bytes[#bytes+1] = string.char(b1*4 + math.floor(b2/16)) end
-        if b2 and str:sub(i+2, i+2) ~= "=" then bytes[#bytes+1] = string.char((b2%16)*16 + math.floor(b3/4)) end
-        if b3 and str:sub(i+3, i+3) ~= "=" then bytes[#bytes+1] = string.char((b3%4)*64 + b4) end
+local function draw_ui()
+  gfx.set(0.1, 0.1, 0.1, 1)
+  gfx.rect(0, 0, gfx.w, gfx.h, 1)
+
+  gfx.x, gfx.y = 10, 10
+  gfx.set(0.8, 0.8, 0.8, 1)
+  gfx.drawstr("RS5K Video Linker v7.2 (Fixed Rate)")
+
+  gfx.x, gfx.y = 10, 35
+  -- PlayState 4 is the bitmask for "Recording"
+  local is_recording = (reaper.GetPlayState() & 4) == 4 
+
+  if is_recording then
+    gfx.set(1.0, 0.2, 0.2, 1) -- Bright Red
+    gfx.drawstr("STATUS: RECORDING (Video items will be kept)")
+  else
+    gfx.set(0.2, 0.8, 1.0, 1) -- Cyan
+    gfx.drawstr("STATUS: JAM MODE (Video items auto-deleted)")
+  end
+
+  gfx.set(1, 1, 1, 1)
+  gfx.x, gfx.y = 10, 60
+  gfx.drawstr("Note: " .. UI_NOTE .. "   Rate: " .. UI_RATE)
+  gfx.x, gfx.y = 10, 80
+  gfx.set(0.5, 0.5, 1, 1)
+  gfx.drawstr("File: " .. UI_FILE)
+
+  if g_log_frozen then
+    gfx.set(1, 0, 0, 1)
+    gfx.x, gfx.y = 10, 100
+    gfx.drawstr("LOG FROZEN (press R to unfreeze)")
+  end
+  gfx.set(1, 1, 0, 1)
+  local y = g_log_frozen and 120 or 105
+  for i = 1, math.min(#g_log, 16) do
+    gfx.x, gfx.y = 10, y
+    gfx.drawstr(g_log[i])
+    y = y + 16
+  end
+  gfx.update()
+end
+
+--------------------------------------------------------------------------------
+-- HELPERS 
+--------------------------------------------------------------------------------
+local function is_rs5k(track, fx)
+  local ok, param_name = reaper.TrackFX_GetParamName(track, fx, IDX_START_OFFSET, "")
+  if ok and param_name:lower():find("start offset") then
+    return true
+  end
+  return false
+end
+
+local function get_rs5k_midi_channel(tr, fx)
+  local num_params = reaper.TrackFX_GetNumParams(tr, fx)
+  for i = 0, num_params - 1 do
+    local ok, name = reaper.TrackFX_GetParamName(tr, fx, i, "")
+    if ok and name:lower():find("midi chan") then
+      local _, str_val = reaper.TrackFX_GetFormattedParamValue(tr, fx, i, "")
+      local parsed = str_val:match("%d+")
+      return parsed and tonumber(parsed) or 0
     end
-    return table.concat(bytes)
-end
-
--- Parses REAPER note strings (e.g., "A4", "C#3", "Gb-1") into MIDI note numbers
-local function ParseNoteString(note_str)
-  local note_map = { c = 0, d = 2, e = 4, f = 5, g = 7, a = 9, b = 11 }
-  
-  -- Try to match the note string
-  local note_char, accidental, octave = note_str:match("([A-Ga-g])([#b]?)(-?[0-9]+)")
-  
-  if not note_char then
-    --msg("Error parsing note string: " .. note_str .. ". Defaulting to A4 (69).")
-    return 69 -- Default to A4 if parsing fails
   end
-  
-  local note_val = note_map[note_char:lower()]
-  
-  if accidental == "#" then
-    note_val = note_val + 1
-  elseif accidental == "b" then
-    note_val = note_val - 1
-  end
-  
-  local octave_val = tonumber(octave)
-  
-  -- Calculate MIDI note number (MIDI standard C-1=0, A4=69)
-  local midi_note = note_val + (octave_val + 1) * 12
-  
-  return midi_note
+  return 0
 end
-
 
 local function get_or_create_video_track()
-  for i = 0, reaper.CountTracks(0)-1 do
+  for i = 0, reaper.CountTracks(0) - 1 do
     local tr = reaper.GetTrack(0, i)
     local _, name = reaper.GetTrackName(tr, "")
     if name == VIDEO_TRACK_NAME then return tr end
   end
   reaper.InsertTrackAtIndex(reaper.CountTracks(0), true)
-  local tr = reaper.GetTrack(0, reaper.CountTracks(0)-1)
+  local tr = reaper.GetTrack(0, reaper.CountTracks(0) - 1)
   reaper.GetSetMediaTrackInfo_String(tr, "P_NAME", VIDEO_TRACK_NAME, true)
-  reaper.SetMediaTrackInfo_Value(tr, "I_RECMON", 0)
   return tr
 end
- --[[
-local function find_rs5k_fx(track)
-  local fx_count = reaper.TrackFX_GetCount(track)
-  local rs5k_prefix = "(rs5k)" -- Custom prefix check
-  local internal_name = "reasamplomatic5000" -- Fallback check
-
-  for fx = 0, fx_count - 1 do
-    local retval, name = reaper.TrackFX_GetFXName(track, fx, "")
-    
-    if retval and name then
-      local lower_name = name:lower()
-      
-      -- Check 1: Match the custom prefix (e.g., (RS5K)Sample.mp4)
-      if lower_name:find(rs5k_prefix) then 
-        return fx 
-      end
-      
-      -- Check 2: Fallback to the internal plugin name 
-      if lower_name:find(internal_name) then
-        return fx
-      end
-    end
-  end
-  
-  return nil
-end
---]]
 
 local function get_sample_path(track, fx)
-  
-  -- 1. Try standard named parameters first (for general compatibility)
   for _, key in ipairs({"FILE", "FILE0", "FILE1"}) do
     local ok, val = reaper.TrackFX_GetNamedConfigParm(track, fx, key)
-    if ok and val and val ~= "" and val:lower():find(".mp4") then 
-      -- Clean up the string just in case the API call didn't fully clean it
-      val = val:gsub('\0', ''):gsub('%s+$', '')
-      return val 
+    if ok and val and val ~= "" and (val:lower():find("%.mp4") or val:lower():find("%.mkv") or val:lower():find("%.mov")) then
+      local clean = val:gsub('\0', ''):gsub('%s+$', '')
+      UI_FILE = clean:match("[/\\]([^/\\]+)$") or clean
+      return clean
     end
   end
-
-  -- 2. Fallback: Manually read the state chunk for the Base64 file string (for VST state)
-  local ok, chunk = reaper.GetTrackStateChunk(track, "", false)
-  if ok and chunk then
-    
-    -- Pattern to target the VST block and specifically capture the Base64 line that starts with 'QzpcV' (C:\...)
-    local rs5k_block, b64_path_line = chunk:match(
-      '<VST "VSTi: ReaSamplOmatic5000 (Cockos)".-\n' .. 
-      '.-[\r\n]' .. -- Skip first Base64 line
-      '(QzpcV.-)[\r\n]' -- Capture second Base64 line
-    ) 
-
-    if b64_path_line then
-      -- Remove potential trailing garbage before decoding
-      b64_path_line = b64_path_line:match("^%S+") 
-
-      local decoded_data = base64_decode(b64_path_line)
-
-      -- Extract the path: C:\... ending in .mp4
-      local path = decoded_data:match("(C:\\.-%.mp4)") 
-
-      if path then
-        -- Clean up null bytes and trailing whitespace from the decoded string
-        path = path:gsub('\0', ''):gsub('%s+$', '')
-        --msg("Path found via Base64 decode: " .. path)
-        return path
-      end
-    end
-  end
-
   return nil
-end
-
-
-local function get_pcm_source(path)
-  if source_cache[path] then 
-    --msg("Cache hit for: " .. path)
-    return source_cache[path] 
-  end
-  
-  -- Step 1: Print the path being used
-  --msg("Attempting to load PCM_Source from path: [" .. path .. "]")
-  
-  -- Ensure only standard Windows directory separators are used (optional safety)
-  local clean_path = path:gsub("/", "\\")
-  
-  -- Step 2: Attempt to create the source
-  local src = reaper.PCM_Source_CreateFromFile(clean_path)
-  
-  -- Step 3: Check the result and report
-  if src then
-    --msg("SUCCESS: PCM_Source created.")
-    source_cache[path] = src
-    return src
-  else
-    --msg("FAILURE: reaper.PCM_Source_CreateFromFile failed for path: [" .. clean_path .. "]")
-    -- Return nil so the calling function can exit gracefully
-    return nil 
-  end
 end
 
 local function get_rs5k_params(track, fx)
-
-  -- 1. Get Start/Length (Params 13, 14)
-  local _, start_str = reaper.TrackFX_GetFormattedParamValue(track, fx, START_OFFSET_PARAM_IDX, "")
-  local _, length_str = reaper.TrackFX_GetFormattedParamValue(track, fx, LENGTH_PARAM_IDX, "")
-  local start_offset_norm = tonumber(start_str)
-  local length_norm = tonumber(length_str)
-
-  -- 2. Get Note Start (Param 3)
-  -- This is our "trigger anchor"
-  local note_start_norm = reaper.TrackFX_GetParam(track, fx, NOTE_START_PARAM_IDX, 0, 0)
-  local note_start = math.floor(note_start_norm * 127 + 0.5)
-
-  -- 3. Get Pitch@start Offset (Param 5)
-  local _, pitch_offset_str = reaper.TrackFX_GetFormattedParamValue(track, fx, PITCH_ROOT_NOTE_IDX, "")
-  
-  -- *** NEW SAFETY CHECK ***
-  -- If the string is nil, default it to "0" to prevent a crash.
-  if not pitch_offset_str then pitch_offset_str = "0" end
-
-  -- 4. Extract the number from the string (e.g., "-6")
-  local pitch_start_offset = tonumber(pitch_offset_str:match("(-?[0-9]+)")) or 0
-
-  -- 5. Calculate the TRUE Root Note (Your Logic)
-  -- 60 - (-6) = 66
-  local root_note = note_start - pitch_start_offset
-  
-  -- Apply safety clamps
-  start_offset_norm = math.max(0, math.min(1, start_offset_norm or 0))
-  length_norm = math.max(0, math.min(1, length_norm or 1))
-
-  -- Calculate the *actual* End Offset
-  --local end_offset_norm = start_offset_norm + (1 - start_offset_norm) * length_norm
-  local end_offset_norm = length_norm
-
-  -- Debug Print
-  msg("DEBUG PARAMS (NEW LOGIC):")
-  msg("  Start Offset (Param 13): " .. string.format("%.3f", start_offset_norm))
-  msg("  Length (Param 14): " .. string.format("%.3f", length_norm))
-  msg("  Note Start (Param 3): " .. note_start)
-  msg("  Pitch Offset (Param 5): " .. pitch_start_offset .. " semitones (from string '" .. pitch_offset_str .. "')")
-  msg("  EFFECTIVE Root Note: " .. root_note .. " (NoteStart - Offset)")
-  msg("  CALCULATED End Offset: " .. string.format("%.3f", end_offset_norm))
-
-  -- Sanity Check
-  if end_offset_norm <= start_offset_norm then
-      --msg("WARNING: RS5K sample range is zero/negative. Forcing Start=0.0, End=1.0.")
-      start_offset_norm = 0.0
-      end_offset_norm = 1.0
-  end
-
-  -- Return the start/end offsets and the calculated root note
-  return start_offset_norm, end_offset_norm, root_note
+  local start_norm = reaper.TrackFX_GetParamNormalized(track, fx, IDX_START_OFFSET)
+  local len_norm   = reaper.TrackFX_GetParamNormalized(track, fx, IDX_LENGTH)
+  local obey_raw   = reaper.TrackFX_GetParam(track, fx, IDX_OBEY_NOTE_OFFS, 0, 0)
+  return start_norm, len_norm, obey_raw >= 0.5
 end
 
---------------------------------------------------
--- 🎞️ Video Spawning / Removal
---------------------------------------------------
--- NEW SIGNATURE: a_pitch_norm is replaced with incoming_note and root_note
-local function spawn_video(path, start_norm, end_offset_norm, incoming_note, root_note)
-  if not path or path == "" then return end
+--------------------------------------------------------------------------------
+-- SPAWN VIDEO ITEM
+--------------------------------------------------------------------------------
+local function spawn_video(path, start_norm, len_norm, note, channel, place_pos)
+  if not path or path == "" then return nil end
 
-  -- Create the media source
   local src = reaper.PCM_Source_CreateFromFile(path)
-  if not src then
-    reaper.ShowConsoleMsg("❌ Could not load media source: " .. path .. "\n")
-    return
-  end
+  if not src then return nil end
 
-  -- Get the full source length (audio or video)
-  local full_src_length = reaper.GetMediaSourceLength(src)
-  if not full_src_length or full_src_length <= 0 then
-    reaper.ShowConsoleMsg("⚠️ Invalid media length for " .. path .. "\n")
-    return
-  end
+  local full_len   = reaper.GetMediaSourceLength(src)
+  local start_time = start_norm * full_len
+  local end_time   = len_norm   * full_len
+  local dur        = math.max(end_time - start_time, 0.05)
 
-  -- Convert RS5K's normalized offsets (0–1) to seconds
-  local start_time = start_norm * full_src_length
-  local end_time   = end_offset_norm * full_src_length
-  local duration   = end_time - start_time
-  if duration <= 0 then duration = 0.05 end
+  -- The Fix: Lock base rate to 1.0, only modify via pitch bend wheel
+  local rate = 2 ^ (g_bend_semitones / 12)
 
-  -- *** NEW PLAYRATE CALCULATION ***
--- Calculate semitone difference, NOW including the current pitch bend
-  local semitone_diff = (incoming_note - root_note) + g_current_bend_semitones
-  -- Calculate rate: 2^(semitones / 12)
-  local playrate = 2 ^ (semitone_diff / 12)
+  UI_NOTE = string.format("CH %d | Note %d", channel, note)
+  UI_RATE = string.format("%.2fx", rate)
 
-  -- Make or find the "Video" track
-  local video_tr = get_or_create_video_track()
-  local item = reaper.AddMediaItemToTrack(video_tr)
+  local tr   = get_or_create_video_track()
+  local item = reaper.AddMediaItemToTrack(tr)
   local take = reaper.AddTakeToMediaItem(item)
   reaper.SetMediaItemTake_Source(take, src)
-
-  -- Set the take's audio volume to 0 (-inf dB)
   reaper.SetMediaItemTakeInfo_Value(take, "D_VOL", 0)
 
-  -- Place at current play position
-  local play_pos = reaper.GetPlayPosition()
-  reaper.SetMediaItemInfo_Value(item, "D_POSITION", play_pos)
-
-  -- Apply RS5K slice and the NEWLY CALCULATED rate
+  reaper.SetMediaItemInfo_Value(item,     "D_POSITION",  place_pos)
   reaper.SetMediaItemTakeInfo_Value(take, "D_STARTOFFS", start_time)
-  reaper.SetMediaItemTakeInfo_Value(take, "D_PLAYRATE", playrate)
-  reaper.SetMediaItemInfo_Value(item, "D_LENGTH", duration / playrate)
+  reaper.SetMediaItemTakeInfo_Value(take, "D_PLAYRATE",  rate)
+  reaper.SetMediaItemInfo_Value(item,     "D_LENGTH",    dur / rate)
 
   reaper.UpdateArrange()
-
-  reaper.ShowConsoleMsg(string.format(
-    "🎞 Spawned video: %s\n  Start: %.3fs  Dur: %.3fs  Rate: %.3fx\n",
-    path, start_time, duration, playrate))
-    
-  return item, take
+  return item, take, start_time, dur
 end
 
-
-
-
-local function remove_video_item(item)
-  if not reaper.ValidatePtr2(0, item, "MediaItem*") then return end
-  local tr = get_or_create_video_track()
-  reaper.DeleteTrackMediaItem(tr, item)
-  reaper.UpdateArrange()
-end
-
---------------------------------------------------
--- 🎹 MIDI Input Handling
---------------------------------------------------
-local function handle_note_on(note)
-  msg("--- handle_note_on triggered. Note: " .. note)
-
-  -- *** NEW RE-TRIGGER LOGIC ***
-  if note_to_item[note] then 
-    msg("Note " .. note .. " is already on. Forcing re-trigger...")
-    -- Call handle_note_off to trim the old item and unlock the note
-    handle_note_off(note) 
-  end
-  -- *** END NEW LOGIC ***
-
-  -- Loop ALL tracks
-  for t = 0, reaper.CountTracks(0) - 1 do
-    local track = reaper.GetTrack(0, t)
-    
-    -- Loop ALL FX on this track
-    for fx = 0, reaper.TrackFX_GetCount(track) - 1 do
-    
-      -- Check if this specific FX is an RS5k
-      local retval, name = reaper.TrackFX_GetFXName(track, fx, "")
-      
-      -- A simple check for the plugin name
-      if retval and name and (name:find("ReaSamplOmatic5000") or name:lower():find("(rs5k)")) then
-        msg("Found RS5k on track " .. t .. ", FX slot " .. fx)
-        
-        -- Get this RS5k's note range
-        local note_start = math.floor(reaper.TrackFX_GetParam(track, fx, NOTE_START_PARAM_IDX, 0, 0) * 127 + 0.5)
-        local note_end = math.floor(reaper.TrackFX_GetParam(track, fx, NOTE_END_PARAM_IDX, 0, 0) * 127 + 0.5)
-        
-        msg("Checking note range... Script read: " .. note_start .. " to " .. note_end)
-
-        -- Check if the note we played is within this plugin's range
-        if note >= note_start and note <= note_end then
-          msg("Note " .. note .. " is IN RANGE.")
-          
-          local path = get_sample_path(track, fx) -- Pass the correct 'fx' index
-          msg("Checking path... Path found: " .. (path or "nil"))
-          
-          if path and path:lower():find(".mp4") then
-            msg("Path is a valid .mp4. Calling spawn_video...")
-            
-            local start_norm, end_norm, root_note = get_rs5k_params(track, fx)
-            
-            local item, take = spawn_video(path, start_norm, end_norm, note, root_note) 
-            
-            if item and take then
-              note_to_item[note] = {
-                item = item,
-                take = take,
-                start_time = reaper.GetPlayPosition(),
-                root_note = root_note,
-                incoming_note = note
-              }
-              msg("Video spawned and locked to note " .. note)
-              
-            else
-              msg("ERROR: spawn_video was called but returned nil.")
-            end
-          else
-            msg("Path was nil or not an .mp4. Aborting this FX.")
-          end
-        else
-          msg("Note " .. note .. " is OUTSIDE range. Checking next FX.")
-        end -- end if note in range
-      end -- end if is rs5k
-    end -- end FX loop
-  end -- end track loop
-end
-
-local function handle_note_off(note)
-  local info = note_to_item[note]
+--------------------------------------------------------------------------------
+-- VOICE MANAGEMENT
+--------------------------------------------------------------------------------
+local function trim_and_remove_voice(voice_key)
+  local info = active_voices[voice_key]
   if not info then return end
-  
-  if info and info.item then
-    local item = info.item
+
+  local is_recording = (reaper.GetPlayState() & 4) == 4
+
+  if info.item and reaper.ValidatePtr2(0, info.item, "MediaItem*") then
     
-    -- *** NEW VALIDATION LINE ***
-    -- Check if the item pointer is still valid before using it
-    if not reaper.ValidatePtr2(0, item, "MediaItem*") then
-      msg("Note Off: Item pointer was invalid, skipping trim.")
-      note_to_item[note] = nil -- Clear the invalid lock
-      return 
+    if not is_recording then
+      -- JAM MODE: Vaporize the item completely to keep the timeline clean
+      local tr = reaper.GetMediaItemTrack(info.item)
+      if tr then
+        reaper.DeleteTrackMediaItem(tr, info.item)
+        log("JAM MODE: Auto-deleted video item.")
+      end
+      
+    else
+      -- RECORDING MODE: Trim it to match the exact length of the held note
+      local now = reaper.GetPlayState() > 0 and reaper.GetPlayPosition() or reaper.GetCursorPosition()
+      local new_dur = now - info.start_time
+      local max_dur = reaper.GetMediaItemInfo_Value(info.item, "D_LENGTH")
+      if new_dur > 0 and new_dur < max_dur then
+        reaper.SetMediaItemInfo_Value(info.item, "D_LENGTH", new_dur)
+      end
     end
     
-    -- Get the time the note was released
-    local note_off_time = reaper.GetPlayPosition()
-    
-    -- Calculate the new duration (how long the key was held)
-    local new_duration = note_off_time - info.start_time
-    
-    -- Get the item's current (maximum) length
-    local max_duration = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
-    
-    -- Check if the new duration is shorter than the max
-    if new_duration > 0 and new_duration < max_duration then
-      -- Trim the item by setting its new, shorter length
-      reaper.SetMediaItemInfo_Value(item, "D_LENGTH", new_duration)
-      reaper.UpdateArrange()
-      msg("Note Off: Trimmed item to " .. new_duration .. "s")
-    end  -- end new duration
-  end -- <<< ADD THIS \'END\' to close 'if info and info.item then'
-  -- Clear the note from the active table
-  note_to_item[note] = nil
+  end
+
+  active_voices[voice_key] = nil
+  g_voice_count = g_voice_count - 1
 end
 
-local function handle_modwheel(val) -- val is 0-127
-  -- This function is now separate from the loop and clean
-  local norm = val / 127
+local function stop_transport_if_owned()
+  if g_transport_owned then
+    reaper.Main_OnCommand(1016, 0)
+    reaper.SetEditCurPos(g_initial_cursor_pos, true, false)
+    g_transport_owned = false
+  end
+end
+
+--------------------------------------------------------------------------------
+-- MIDI HANDLERS
+--------------------------------------------------------------------------------
+local function handle_note_on(channel, note)
+  g_last_played.chan = channel
+  g_last_played.note = note
+  local voice_key = channel .. "_" .. note
+
+  if active_voices[voice_key] then
+    trim_and_remove_voice(voice_key)
+  end
+
   for t = 0, reaper.CountTracks(0) - 1 do
-    local track = reaper.GetTrack(0, t)
-    local fx = find_rs5k_fx(track)
-    if fx then
-      reaper.TrackFX_SetParam(track, fx, START_OFFSET_PARAM_IDX, norm)
+    local tr = reaper.GetTrack(0, t)
+    for fx = 0, reaper.TrackFX_GetCount(tr) - 1 do
+      
+      if is_rs5k(tr, fx) then
+        local rs5k_chan = get_rs5k_midi_channel(tr, fx)
+        
+        if rs5k_chan == 0 or rs5k_chan == channel then
+          local n_start = math.floor(reaper.TrackFX_GetParam(tr, fx, IDX_NOTE_START, 0, 0) * 127 + 0.5)
+          local n_end   = math.floor(reaper.TrackFX_GetParam(tr, fx, IDX_NOTE_END,   0, 0) * 127 + 0.5)
+
+   if note >= n_start and note <= n_end then
+            local path = get_sample_path(tr, fx)
+            if path then
+             -- 1. Read the current live knobs from the RS5K UI
+              local fx_guid = reaper.TrackFX_GetFXGUID(tr, fx)
+              local current_ui_offset = reaper.TrackFX_GetParamNormalized(tr, fx, IDX_START_OFFSET)
+              local len_norm = reaper.TrackFX_GetParamNormalized(tr, fx, IDX_LENGTH)
+
+              -- 2. Detect if YOU manually tweaked the knob since the last pad hit
+              -- If the current UI matches our last scripted override, you haven't touched it.
+              if g_last_forced_offset[fx_guid] and math.abs(current_ui_offset - g_last_forced_offset[fx_guid]) < 0.001 then
+                -- Restore our saved base offset
+                current_ui_offset = g_base_offsets[fx_guid] or current_ui_offset
+              else
+                -- YOU moved the knob manually! Save this new position as the permanent base.
+                g_base_offsets[fx_guid] = current_ui_offset
+              end
+
+              -- 3. Calculate the Stutter Target
+              local target_offset = current_ui_offset
+              if g_mod_wheel_val > 0.01 then
+                -- Add the wheel jump ON TOP of your manual start tweak
+                target_offset = current_ui_offset + (g_mod_wheel_val * (len_norm * 0.95))
+                if target_offset > 1.0 then target_offset = 1.0 end
+              end
+
+              -- 4. Instantly push the correct start time to the audio plugin
+              reaper.TrackFX_SetParamNormalized(tr, fx, IDX_START_OFFSET, target_offset)
+              g_last_forced_offset[fx_guid] = target_offset
+
+              local obey_raw = reaper.TrackFX_GetParam(tr, fx, IDX_OBEY_NOTE_OFFS, 0, 0)
+              local obey_note_offs = (obey_raw >= 0.5)
+
+              local place_pos
+              if reaper.GetPlayState() == 0 then
+                place_pos = reaper.GetCursorPosition()
+              else
+                place_pos = reaper.GetPlayPosition()
+              end
+
+              -- 5. Spawn the video using that exact same synchronized offset
+              local item, take = spawn_video(path, target_offset, len_norm, note, channel, place_pos)
+
+              if item then
+                active_voices[voice_key] = {
+                  item           = item,
+                  take           = take,
+                  start_time     = place_pos,
+                  obey_note_offs = obey_note_offs,
+                }
+                g_voice_count = g_voice_count + 1
+              end
+            end
+          end
+        end
+      end
     end
   end
 end
 
-local function handle_pitch_bend(val) -- val is 0-16383
-  -- OPTIMIZATION...
-  local pitch_bucket = math.floor(val / 64)
-  if pitch_bucket == last_pitch_bucket then
+local function handle_note_off(channel, note)
+  local voice_key = channel .. "_" .. note
+  local info      = active_voices[voice_key]
+
+  if not info then return end
+
+  if not info.obey_note_offs then
     return
   end
-  last_pitch_bucket = pitch_bucket
 
-  -- 1. CALCULATE AND STORE THE NEW GLOBAL BEND
-  g_current_bend_semitones = ((val - 8192) / 8191) * PITCH_BEND_RANGE_SEMITONES
-  
-  -- We no longer save to the project.
+  trim_and_remove_voice(voice_key)
+
+  if g_voice_count <= 0 then
+    g_voice_count = 0
+    stop_transport_if_owned()
+  end
+  reaper.UpdateArrange()
 end
 
---------------------------------------------------
--- 🎞️ Decoupled UI Updater (15fps)
---------------------------------------------------
-local function updater()
-  -- Loop through all currently playing notes
-  for note, info in pairs(note_to_item) do
-    if info and info.take and reaper.ValidatePtr2(0, info.take, "MediaItem_Take*") then
+local function handle_bend(val)
+  local bucket = math.floor(val / 64)
+  if bucket == g_last_pitch_bucket then return end
+  g_last_pitch_bucket = bucket
+  g_bend_semitones = ((val - 8192) / 8191) * PITCH_BEND_RANGE_ST
+end
+
+
+local function handle_mod_wheel(val)
+  local norm = val / 127.0
+  for key, info in pairs(active_voices) do
+    if reaper.ValidatePtr2(0, info.item, "MediaItem*") and reaper.ValidatePtr2(0, info.take, "MediaItem_Take*") then
       
-      -- Read the base note and the *current global bend*
-      local base_semitones = info.incoming_note - info.root_note
-      local total_semitones = base_semitones + g_current_bend_semitones
+      -- 1. How long has this note been playing?
+      local now = reaper.GetPlayState() > 0 and reaper.GetPlayPosition() or reaper.GetCursorPosition()
+      local elapsed = now - info.start_time
       
-      -- Calculate and set the new rate
-      local new_rate = 2 ^ (total_semitones / 12)
-      reaper.SetMediaItemTakeInfo_Value(info.take, "D_PLAYRATE", new_rate)
+      -- 2. Where should the playhead be based on the Mod Wheel? (0.0 to 1.0)
+      local target_media_pos = info.base_start_offs + (norm * info.slice_dur)
+      
+      -- 3. Shift the underlying video so the target position perfectly aligns with 'now'
+      local new_take_offs = target_media_pos - elapsed
+      
+      reaper.SetMediaItemTakeInfo_Value(info.take, "D_STARTOFFS", new_take_offs)
+      reaper.UpdateItemInProject(info.item)
+      
+      log(string.format("Scrub: %.1f%%", norm * 100))
     end
   end
-  
-
-  reaper.defer(updater)
 end
 
---------------------------------------------------
--- ♻️ Main Deferred Loop (Correct Latching Logic)
---------------------------------------------------
-
+--------------------------------------------------------------------------------
+-- MAIN LOOP
+--------------------------------------------------------------------------------
 local function main()
+  local char = gfx.getchar()
+  if char < 0 then return end 
 
-  -- *** NEW "FIRST RUN" LOGIC ***
+  if char == string.byte('r') or char == string.byte('R') then
+    g_log_frozen = false
+  end
+
+  draw_ui()
+
   if g_is_first_run then
-    -- On the very first run, we find the sequence number
-    -- of the MOST recent event in the history and use it
-    -- as our starting point. This ignores the entire "blob".
-    local retval, _, _, _, _, _ = reaper.MIDI_GetRecentInputEvent(0)
-    
-    if retval > 0 then
-      last_processed_event_seq = retval
-    end
-    
-    msg("Script initialized. Ignoring all past MIDI history.")
-    
-    -- Set the flag to false so this block never runs again
+    g_last_seq   = reaper.MIDI_GetRecentInputEvent(0)
     g_is_first_run = false
-    
-    -- Defer and exit this run
     reaper.defer(main)
     return
   end
-  -- *** END NEW LOGIC ***
-  
-  
-  -- This is your existing, correct loop.
-  -- It will now only find events with a sequence
-  -- number greater than the one we just latched.
-  local events_to_process = {}
-  local new_last_seq = 0
-  local idx = 0
-  local did_process_note = false -- Flag to update arrange only if needed
 
-  -- 1. Latch the queue and find all new events
+  local idx     = 0
+  local new_seq = 0
+  local did_act = false
+
   while true do
-    local retval, msg_str, ts, devIdx, projPos, projLoopCnt = reaper.MIDI_GetRecentInputEvent(idx)
-    
-    if retval > 0 and retval > last_processed_event_seq then
-      table.insert(events_to_process, {
-        seq = retval,
-        msg = msg_str
-      })
-      
-      if new_last_seq == 0 then
-        new_last_seq = retval
+    local seq, m = reaper.MIDI_GetRecentInputEvent(idx)
+    if seq <= 0 or seq <= g_last_seq then break end
+
+    if new_seq == 0 then new_seq = seq end
+
+    if m and #m >= 1 then
+      local b1      = string.byte(m, 1) or 0
+      local b2      = string.byte(m, 2) or 0
+      local b3      = string.byte(m, 3) or 0
+      local status  = b1 & 0xF0
+      local channel = (b1 & 0x0F) + 1
+
+      if     status == 0x90 and b3 > 0 then
+        handle_note_on(channel, b2)
+      elseif status == 0x80 or (status == 0x90 and b3 == 0) then
+        handle_note_off(channel, b2)
+      elseif status == 0xE0 then
+        handle_bend((b3 * 128) + b2)
+	  elseif status == 0xB0 and b2 == 1 then  -- NEW: Listen for Mod Wheel (CC 1)
+        g_mod_wheel_val = b3 / 127.0          -- Convert 0-127 MIDI to a 0.0-1.0 percentage
       end
-      
-      idx = idx + 1
-    else
-      break
+      did_act = true
+    end
+    idx = idx + 1
+  end
+
+  if new_seq > 0 then g_last_seq = new_seq end
+
+  if g_pending_play then
+    g_pending_play = false
+    reaper.Main_OnCommand(1007, 0)
+  end
+
+  for key, info in pairs(active_voices) do
+    if reaper.ValidatePtr2(0, info.take, "MediaItem_Take*") then
+      local rate = 2 ^ (g_bend_semitones / 12)
+      reaper.SetMediaItemTakeInfo_Value(info.take, "D_PLAYRATE", rate)
     end
   end
 
-  -- 2. If we found new events, update our "last processed" marker
-  if new_last_seq > 0 then
-    last_processed_event_seq = new_last_seq
-  end
-
-  -- 3. Process the events we collected, in reverse order (oldest to newest)
-  for i = #events_to_process, 1, -1 do
-    local event = events_to_process[i]
-    local msg_str = event.msg
-    
-    if msg_str and #msg_str >= 3 then
-      local b1, b2, b3 = string.byte(msg_str, 1, 3)
-      local status = b1 & 0xF0
-
-      if status == 0x90 then -- Note On
-        if b3 > 0 then handle_note_on(b2)
-        else handle_note_off(b2) end
-        did_process_note = true
-        
-      elseif status == 0x80 then -- Note Off
-        handle_note_off(b2)
-        did_process_note = true
-        
-      elseif status == 0xB0 and b2 == 1 then -- CC1 (Mod Wheel)
-        --handle_modwheel(b3) -- Still DISABLED
-        
-      elseif status == 0xE0 then -- Pitch Bend
-        local bend_val = (b3 * 128) + b2 -- 14-bit value
-        handle_pitch_bend(bend_val)
-      end
-    end
-  end
-
-  -- 4. Update the screen once, only if we processed notes
-  if did_process_note then
-    reaper.UpdateArrange()
-  end
-
+  if did_act then reaper.UpdateArrange() end
   reaper.defer(main)
 end
 
---------------------------------------------------
--- 🚀 Start
---------------------------------------------------
-reaper.ShowConsoleMsg("RS5K Video Sampler (v2.0 Queue-Based) running...\n")
-get_or_create_video_track()
+init_ui()
 main()
-updater() -- <<< ADD THIS to start the 15fps UI loop
-  
