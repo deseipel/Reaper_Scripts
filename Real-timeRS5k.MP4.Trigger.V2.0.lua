@@ -330,7 +330,7 @@ local function handle_note_on(channel, note)
       end
     end
   end
-end
+
 
 local function handle_note_off(channel, note)
   local voice_key = channel .. "_" .. note
