@@ -15,6 +15,7 @@ local IDX_NOTE_END           = 4
 local IDX_START_OFFSET       = 13
 local IDX_LENGTH             = 14
 local IDX_OBEY_NOTE_OFFS     = 11
+local IDX_PITCH_OFFSET       = 5  -- NEW: Param 5 is Pitch@start
 
 --------------------------------------------------------------------------------
 -- STATE
@@ -159,7 +160,7 @@ end
 --------------------------------------------------------------------------------
 -- SPAWN VIDEO ITEM
 --------------------------------------------------------------------------------
-local function spawn_video(path, start_norm, len_norm, note, channel, place_pos)
+local function spawn_video(path, start_norm, len_norm, note, channel, place_pos,root_note)
   if not path or path == "" then return nil end
 
   local src = reaper.PCM_Source_CreateFromFile(path)
@@ -169,6 +170,10 @@ local function spawn_video(path, start_norm, len_norm, note, channel, place_pos)
   local start_time = start_norm * full_len
   local end_time   = len_norm   * full_len
   local dur        = math.max(end_time - start_time, 0.05)
+  
+  -- NEW: Bring back the melodic pitch math!
+  local semitone_diff = (note - root_note) + g_bend_semitones
+  local rate = 2 ^ (semitone_diff / 12)
 
   -- The Fix: Lock base rate to 1.0, only modify via pitch bend wheel
   local rate = 2 ^ (g_bend_semitones / 12)
@@ -260,25 +265,28 @@ local function handle_note_on(channel, note)
    if note >= n_start and note <= n_end then
             local path = get_sample_path(tr, fx)
             if path then
-             -- 1. Read the current live knobs from the RS5K UI
+            -- 1. Read the current live knobs from the RS5K UI
               local fx_guid = reaper.TrackFX_GetFXGUID(tr, fx)
               local current_ui_offset = reaper.TrackFX_GetParamNormalized(tr, fx, IDX_START_OFFSET)
               local len_norm = reaper.TrackFX_GetParamNormalized(tr, fx, IDX_LENGTH)
 
+              -- NEW: Calculate the effective root note for melodic pitching
+              local note_start_norm = reaper.TrackFX_GetParam(tr, fx, IDX_NOTE_START, 0, 0)
+              local note_start = math.floor(note_start_norm * 127 + 0.5)
+              local _, pitch_offset_str = reaper.TrackFX_GetFormattedParamValue(tr, fx, IDX_PITCH_OFFSET, "")
+              local pitch_start_offset = tonumber((pitch_offset_str or "0"):match("(-?[0-9]+)")) or 0
+              local root_note = note_start - pitch_start_offset
+
               -- 2. Detect if YOU manually tweaked the knob since the last pad hit
-              -- If the current UI matches our last scripted override, you haven't touched it.
               if g_last_forced_offset[fx_guid] and math.abs(current_ui_offset - g_last_forced_offset[fx_guid]) < 0.001 then
-                -- Restore our saved base offset
                 current_ui_offset = g_base_offsets[fx_guid] or current_ui_offset
               else
-                -- YOU moved the knob manually! Save this new position as the permanent base.
                 g_base_offsets[fx_guid] = current_ui_offset
               end
 
               -- 3. Calculate the Stutter Target
               local target_offset = current_ui_offset
               if g_mod_wheel_val > 0.01 then
-                -- Add the wheel jump ON TOP of your manual start tweak
                 target_offset = current_ui_offset + (g_mod_wheel_val * (len_norm * 0.95))
                 if target_offset > 1.0 then target_offset = 1.0 end
               end
@@ -297,8 +305,8 @@ local function handle_note_on(channel, note)
                 place_pos = reaper.GetPlayPosition()
               end
 
-              -- 5. Spawn the video using that exact same synchronized offset
-              local item, take = spawn_video(path, target_offset, len_norm, note, channel, place_pos)
+              -- 5. Spawn the video passing the 'root_note'
+              local item, take, start_time, dur = spawn_video(path, target_offset, len_norm, note, channel, place_pos, root_note)
 
               if item then
                 active_voices[voice_key] = {
@@ -306,8 +314,15 @@ local function handle_note_on(channel, note)
                   take           = take,
                   start_time     = place_pos,
                   obey_note_offs = obey_note_offs,
+                  base_start_offs= target_offset,  -- For DJ Stutter
+                  slice_dur      = dur,            -- For DJ Stutter
+                  root_note      = root_note,      -- NEW: For live Pitch Bend
+                  incoming_note  = note            -- NEW: For live Pitch Bend
                 }
                 g_voice_count = g_voice_count + 1
+              end
+
+
               end
             end
           end
@@ -425,9 +440,11 @@ local function main()
     reaper.Main_OnCommand(1007, 0)
   end
 
-  for key, info in pairs(active_voices) do
+ for key, info in pairs(active_voices) do
     if reaper.ValidatePtr2(0, info.take, "MediaItem_Take*") then
-      local rate = 2 ^ (g_bend_semitones / 12)
+      -- Re-calculate with melodic math so the pitch wheel bends the already-pitched video
+      local semitone_diff = (info.incoming_note - info.root_note) + g_bend_semitones
+      local rate = 2 ^ (semitone_diff / 12)
       reaper.SetMediaItemTakeInfo_Value(info.take, "D_PLAYRATE", rate)
     end
   end
